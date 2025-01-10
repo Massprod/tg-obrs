@@ -1,0 +1,23 @@
+services:
+  redis:
+    image: redis:latest
+    container_name: tg-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+
+  bot:
+    build:
+      context: ./
+      dockerfile: ./dockerBot
+    container_name: tg-bot
+    depends_on:
+      - redis
+    volumes:
+      - bot-logs:/logs
+    
+volumes:
+  redis-data:
+  bot-logs:
