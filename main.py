@@ -1,14 +1,12 @@
 import os
-import sys
 import json
-import signal
 import base64
 import asyncio
-from redis.asyncio import Redis
 from loguru import logger
-from datetime import datetime
 from dotenv import load_dotenv
+from redis.asyncio import Redis
 from aiohttp import ClientSession
+from datetime import datetime, timedelta
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -118,9 +116,26 @@ async def initial_psm_state() -> dict:
         'perPage': 5,           # <- records per page
         'sortBy': 'Номер',      # <- records sorted by this element 
         'ascending': True,      # <- records sorted in this direction
-        'search': '',           # <- search by this `value`
-        'searchListen': False,  # <- waiting for user to write a `search` value
-        'searchResults': False, # <- currently PSM shows `searchResults` == can restore.
+        'searchBy': {
+            'number': {         # <- records filtered by `Номер`
+                'value': '',
+                'listening': False
+            },
+            'status': {         # <- records filtered by `Состояние`
+                'value': '',
+                'listening': False
+            },
+            'periodStart': {    # <- records filtered by dates => `year.month.day`
+                'value': '',    # <- `S` == separator
+                'listening': False
+            },  
+            'periodEnd': {      # ^same
+                'value': '',
+                'listening': False
+            }
+        },
+        'searchListen': '',  # <- listeting for user input for `searchBy`
+        'openSearch': False,
     }
     return init_state
 # endregion Redis
@@ -134,6 +149,10 @@ sort_map: dict[str, str] = {
 
 rev_sort_map: dict[str, str] = {
     ru: eng for ru, eng in sort_map.items()
+}
+
+search_by_trans: dict[str, str] = {
+    'number': 'Номер',
 }
 
 # region Utility
@@ -515,13 +534,14 @@ async def send_or_edit_psm_message(
     per_page: int = user_state['perPage']
     sort_by: str = user_state['sortBy']
     ascending: int = 1 if user_state['ascending'] else 0
-    search: str = user_state['search']
+    search_by: dict[str, str] = user_state['searchBy']
     # endregion QueryArgs
     get_url: str = f'{API_URL}/{TASKS_ENDPOINT}?'
     query_args: str = f'page={page}&perPage={per_page}&sortBy={sort_by}' \
                       f'&ascending={ascending}'
-    if search:
-        query_args += f'&search={search}'
+    for arg, data in search_by.items():
+        if data['value']:
+            query_args += f'&{arg}={data['value']}'
     get_url = get_url + query_args
     response = await make_get_request(
         get_url, True, False
@@ -543,8 +563,9 @@ async def send_or_edit_psm_message(
         return
     total_records: int = int(data['total_records'])
     total_pages: int = (total_records + per_page - 1) // per_page
+    page = max(min(total_pages, page), 1)
+    user_state['page'] = page
     tasks_data: list[dict] = data['data']
-    search_result: bool = user_state.get('searchResults', False)
     # Task button -> get mesage with an extra info on task
     task_buttons = [
         [
@@ -560,7 +581,7 @@ async def send_or_edit_psm_message(
         task_buttons.append(
             [
                 InlineKeyboardButton(
-                    text=f'Нет данных: {search.strip('%')}', callback_data='none'
+                    text=f'Нет данных.', callback_data='none'
                 )
             ]
         )
@@ -594,18 +615,214 @@ async def send_or_edit_psm_message(
     ]
     settings.append(sorting_row)
     # endregion sortBy
-    # region search
-    search_row = []
-    if not search_result:
-        search_but = InlineKeyboardButton(
-            '🔍 Поиск по `Номер`', callback_data='psm_search_number',  # Other fields?
+    # region searchBy
+    # TODO: add option to show and hide `searchBy` buttons.
+    #  We need to show/hide them + we need to add some separators.
+    if not user_state['openSearch']:
+        search_by_show_but = InlineKeyboardButton(
+            '📋 Показать данные отбора', callback_data='psm_search_show'
         )
+        settings.append([search_by_show_but])
     else:
-        search_but = InlineKeyboardButton(
-            '🔄 Восстановить', callback_data='psm_reset'
+        search_by_opener = InlineKeyboardButton(
+            '📋 Спрятать данные отбора', callback_data='psm_search_show'
         )
-    search_row.append(search_but)
-    settings.append(search_row)
+        settings.append([search_by_opener])
+        # region `number`
+        search_by_number = search_by['number']
+        if not search_by_number['value']:
+            search_but_number = InlineKeyboardButton(
+                '🔍 Установить отбор по `Номер`', callback_data='psm_search_number',
+            )
+        else:
+            search_but_number = InlineKeyboardButton(
+                f'🔄 Убрать отбор `Номер`: {search_by_number['value']}', callback_data='psm_reset_number'
+            )
+        settings.append([search_but_number])
+        # endregion `number`
+        # region `status`
+        search_by_status = search_by['status']
+        if not search_by_status['listening']:
+            search_but_status =InlineKeyboardButton(
+                '🔍 Установить отбор по `Состояние`', callback_data='psm_search_status',
+            )
+            settings.append([search_but_status])
+        else:
+            search_but_status = [[]]
+            complete_str: str = 'Исполнено' if 'complete' != search_by_status['value'] else '✔️ Исполнено'
+            complete_but = InlineKeyboardButton(
+                complete_str, callback_data='psm_search_set_status_complete',
+            )
+            search_but_status[0].append(complete_but)
+
+            active_str: str = 'Активна' if 'active' != search_by_status['value'] else '✔️ Активна'
+            active_but = InlineKeyboardButton(
+                active_str, callback_data='psm_search_set_status_active',
+            )
+            search_but_status[0].append(active_but)
+
+            canceled_str: str = 'Отменена' if 'canceled' != search_by_status['value'] else '✔️ Отменена'
+            canceled_but = InlineKeyboardButton(
+                canceled_str, callback_data='psm_search_set_status_canceled',
+            )
+            search_but_status[0].append(canceled_but)
+            settings.append(search_but_status[0])
+
+            cancel_status_search_but = InlineKeyboardButton(
+                '❌ Отменить отбор по `Состояние`', callback_data='psm_search_unset_status'
+            )
+            settings.append([cancel_status_search_but])
+        # endregion `status`
+        # region `periodStart`
+        search_by_period_start = search_by['periodStart']
+        if not search_by_period_start['listening']:
+            period_start_init_but = InlineKeyboardButton(
+                '🔍 Установить `Начало периода`', callback_data='psm_search_periodStart'
+            )
+            settings.append([period_start_init_but])
+        else:
+            period_start: str = user_state['searchBy']['periodStart']['value']
+            if not period_start:
+                # TODO: .env variable for starting shift?
+                cur_date = datetime.now() - timedelta(days=7)
+                cur_period = f'{cur_date.year}S{cur_date.month}S{cur_date.day}'
+                user_state['searchBy']['periodStart']['value'] = cur_period
+            start_year, start_month, start_day = user_state['searchBy']['periodStart']['value'].split('S')
+            period_start_row = []
+            period_start_header = InlineKeyboardButton(
+                '🕒 Начало периода', callback_data='none'
+            )
+            period_start_row.append([period_start_header])
+
+            year_row = []
+            period_start_year_show = InlineKeyboardButton(
+                f'Год: {start_year}', callback_data='none',
+            )
+            year_row.append(period_start_year_show)
+            period_start_year_increase = InlineKeyboardButton(
+                '⬆️', callback_data='psm_search_periodStart_increase_year',
+            )
+            year_row.append(period_start_year_increase)
+            period_start_year_decrease = InlineKeyboardButton(
+                '⬇️', callback_data='psm_search_periodStart_decrease_year',
+            )
+            year_row.append(period_start_year_decrease)
+            period_start_row.append(year_row)
+            
+            month_row = []
+            period_start_month_show = InlineKeyboardButton(
+                f'Месяц: {start_month}', callback_data='none',
+            )
+            month_row.append(period_start_month_show)
+            period_start_month_increase = InlineKeyboardButton(
+                '⬆️', callback_data='psm_search_periodStart_increase_month',
+            )
+            month_row.append(period_start_month_increase)
+            period_start_month_decrease = InlineKeyboardButton(
+                '⬇️', callback_data='psm_search_periodStart_decrease_month',                
+            )
+            month_row.append(period_start_month_decrease)
+            period_start_row.append(month_row)
+
+            day_row = []
+            period_start_day_show = InlineKeyboardButton(
+                f'День: {start_day}', callback_data='none',
+            )
+            day_row.append(period_start_day_show)
+            period_start_day_increase = InlineKeyboardButton(
+                '⬆️', callback_data='psm_search_periodStart_increase_day',
+            )
+            day_row.append(period_start_day_increase)
+            period_start_day_decrease = InlineKeyboardButton(
+                '⬇️', callback_data='psm_search_periodStart_decrease_day',                
+            )
+            day_row.append(period_start_day_decrease)
+            period_start_row.append(day_row)
+            period_start_unset = InlineKeyboardButton(
+                f'❌ Отменить отбор по `Начало периода`',
+                callback_data='psm_search_unset_periodStart',
+            )
+            period_start_row.append([period_start_unset])
+            for _ in period_start_row:
+                settings.append(_)
+        # endregion `periodStart`
+        # region `periodEnd`
+        search_by_period_start = search_by['periodEnd']
+        if not search_by_period_start['listening']:
+            period_start_init_but = InlineKeyboardButton(
+                '🔍 Установить `Конец периода`', callback_data='psm_search_periodEnd'
+            )
+            settings.append([period_start_init_but])
+        else:
+            period_start: str = user_state['searchBy']['periodEnd']['value']
+            if not period_start:
+                # TODO: .env variable for starting shift?
+                cur_date = datetime.now()
+                cur_period = f'{cur_date.year}S{cur_date.month}S{cur_date.day}'
+                user_state['searchBy']['periodEnd']['value'] = cur_period
+            start_year, start_month, start_day = user_state['searchBy']['periodEnd']['value'].split('S')
+            period_start_row = []
+            period_start_header = InlineKeyboardButton(
+                '🕒 Конец периода', callback_data='none'
+            )
+            period_start_row.append([period_start_header])
+
+            year_row = []
+            period_start_year_show = InlineKeyboardButton(
+                f'Год: {start_year}', callback_data='none',
+            )
+            year_row.append(period_start_year_show)
+            period_start_year_increase = InlineKeyboardButton(
+                '⬆️', callback_data='psm_search_periodEnd_increase_year',
+            )
+            year_row.append(period_start_year_increase)
+            period_start_year_decrease = InlineKeyboardButton(
+                '⬇️', callback_data='psm_search_periodEnd_decrease_year',
+            )
+            year_row.append(period_start_year_decrease)
+            period_start_row.append(year_row)
+            
+            month_row = []
+            period_start_month_show = InlineKeyboardButton(
+                f'Месяц: {start_month}', callback_data='none',
+            )
+            month_row.append(period_start_month_show)
+            period_start_month_increase = InlineKeyboardButton(
+                '⬆️', callback_data='psm_search_periodEnd_increase_month',
+            )
+            month_row.append(period_start_month_increase)
+            period_start_month_decrease = InlineKeyboardButton(
+                '⬇️', callback_data='psm_search_periodEnd_decrease_month',                
+            )
+            month_row.append(period_start_month_decrease)
+            period_start_row.append(month_row)
+
+            day_row = []
+            period_start_day_show = InlineKeyboardButton(
+                f'День: {start_day}', callback_data='none',
+            )
+            day_row.append(period_start_day_show)
+            period_start_day_increase = InlineKeyboardButton(
+                '⬆️', callback_data='psm_search_periodEnd_increase_day',
+            )
+            day_row.append(period_start_day_increase)
+            period_start_day_decrease = InlineKeyboardButton(
+                '⬇️', callback_data='psm_search_periodEnd_decrease_day',                
+            )
+            day_row.append(period_start_day_decrease)
+            period_start_row.append(day_row)
+            period_start_unset = InlineKeyboardButton(
+                f'❌ Отменить отбор по `Конец периода`',
+                callback_data='psm_search_unset_periodEnd',
+            )
+            period_start_row.append([period_start_unset])
+            for _ in period_start_row:
+                settings.append(_)
+        # endregion `periodEnd`
+        search_by_closer = InlineKeyboardButton(
+            '--- --- ---', callback_data='none'
+        )
+        settings.append([search_by_closer])
     # endregion search
     # region pagination
     pagination_row = []
@@ -837,6 +1054,9 @@ async def handle_psm_callbacks(
     
     call_data = query.data.split('_')
     call_type = call_data[0]
+    if 'none' == call_type:
+        await query.answer('Не кликай!')
+        return
     if 'psm' != call_type:
         return
     call_command = call_data[1]
@@ -851,16 +1071,70 @@ async def handle_psm_callbacks(
         user_state['ascending'] = not user_state['ascending']        
         user_state['sortBy'] = sort_map[call_data[2]]
     elif 'reset' == call_command:
-        user_state['searchResults'] = False
-        user_state['search'] = ''
+        reset_value = call_data[2]
+        user_state['searchBy'][reset_value]['value'] = ''
+        user_state['searchBy'][reset_value]['listening'] = False
         user_state['page'] = 1
     elif 'items' == call_command:
         per_page: int = int(call_data[2])
         user_state['perPage'] = per_page
         user_state['page'] = 1
     elif 'search' == call_command:
-        search_type = sort_map[call_data[2]]
-        user_state['searchListen'] = True
+        search_value = call_data[2]
+        if 'show' == search_value:
+            user_state['openSearch'] = not user_state['openSearch']
+        # region `set`
+        # We only set value with buttons == preseted values
+        elif 'set' == search_value:
+            set_type = call_data[3]
+            set_value = call_data[4]
+            user_state['searchBy'][set_type]['value'] = set_value
+        elif 'unset' == search_value:
+            set_type = call_data[3]
+            user_state['searchBy'][set_type]['value'] = ''
+            user_state['searchBy'][set_type]['listening'] = False
+        # endregion `set`
+        # region `number`
+        elif 'number' == search_value:
+            user_state['searchListen'] = True
+            user_state['searchBy']['number']['listening'] = True
+        # endregion `number`
+        # TODO: think about more adequate solution
+        elif 'status' == search_value:
+            user_state['searchBy'][search_value]['listening'] = True
+        elif 'periodStart' == search_value or 'periodEnd' == search_value:
+            today = datetime.now()
+            user_state['searchBy'][search_value]['listening'] = True
+            if len(call_data) > 3:
+                value_state = user_state['searchBy'][search_value]
+                change_type = call_data[3]
+                change_value = call_data[4]
+                cur_year, cur_month, cur_day = [
+                    int(val) for val in value_state['value'].split('S')
+                ]
+                cur_data = {
+                    'year': cur_year,
+                    'month': cur_month,
+                    'day': cur_day,
+                }
+                if 'year' == change_value:
+                    start_year, end_year = 1990, today.year
+                    if change_type == 'increase':
+                        cur_data[change_value] = start_year if cur_data[change_value] == end_year else cur_data[change_value] + 1
+                    elif change_type == 'decrease':
+                        cur_data[change_value] = end_year if cur_data[change_value] == start_year else cur_data[change_value] - 1
+                elif 'month' == change_value:
+                    if change_type == 'increase':
+                        cur_data[change_value] = (cur_data[change_value] % 12) + 1
+                    elif change_type == 'decrease':
+                        cur_data[change_value] = (cur_data[change_value] - 2) % 12 + 1
+                elif 'day' == change_value:
+                    min_day, max_day = 1, 31
+                    if change_type == 'increase':
+                        cur_data[change_value] = min_day if cur_data[change_value] == max_day else cur_data[change_value] + 1
+                    elif change_type == 'decrease':
+                        cur_data[change_value] = max_day if cur_data[change_value] == min_day else cur_data[change_value] - 1
+                user_state['searchBy'][search_value]['value'] = f'{cur_data['year']}S{cur_data['month']}S{cur_data['day']}'
     elif 'restore' == call_command:
         restore_type = call_data[2]
         if 'menu' == restore_type:
@@ -924,9 +1198,14 @@ async def handle_psm_callbacks(
             )
         return
     final_tasks = []
-    if user_state['searchListen']:
+    # TODO: Currently only using msg to get `number`.
+    # So, it's hardcoded version to get `number`.
+    listen_search_by: str = user_state['searchListen']
+    if listen_search_by:
         final_tasks.append(
-            query.answer('Ожидаю `Номер` для поиска')
+            query.answer(
+                f'Ожидаю `Номер` для поиска'
+            )
         )
     else:
         final_tasks.append(
@@ -958,7 +1237,8 @@ async def handle_search_message(
     if not user_record:
         return
     user_state: dict = json.loads(user_record)
-    if not user_state['searchListen']:
+    search_value: str = user_state['searchListen']
+    if not search_value:
         del_ms = await context.bot.send_message(
             chat_id=chat_id,
             text='Сообщения кроме поиска и комманд будут проигнорированы и удалены',
@@ -970,11 +1250,12 @@ async def handle_search_message(
             delete_msg(context, chat_id, update.message.id, 0)
         )
         return
-    search_value = update.message.text
-    user_state['search'] = f'{search_value}'
-    user_state['searchListen'] = False
+    search_value_input: str = update.message.text
+    # TODO: hardcoded version for `number` everything else is set through buttons
+    user_state['searchBy']['number']['value'] = f'{search_value_input}'
+    user_state['searchBy']['number']['listening'] = False
+    user_state['searchListen'] = ''
     user_state['page'] = 1
-    user_state['searchResults'] = True
     await REDIS.set(user_k_string, json.dumps(user_k_string))
     asyncio.create_task(
         delete_msg(context, user_id, update.message.id, 1)
