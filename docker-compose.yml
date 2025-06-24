@@ -1,6 +1,11 @@
 services:
   redis:
     image: redis:latest
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     container_name: tg-redis
     ports:
       - "6379:6379"
@@ -12,6 +17,11 @@ services:
     build:
       context: ./
       dockerfile: ./dockerBot
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     container_name: tg-bot
     depends_on:
       - redis
