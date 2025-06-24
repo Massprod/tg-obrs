@@ -1387,7 +1387,7 @@ def main():
     )
     # endregion PrivateSearchMessageButton
     app.add_handler(
-        CallbackQueryHandler(handle_chat_info, pattern="groupinfo_")
+        CommandHandler("groupinfo", handle_chat_info)
     )
     app.run_polling()
 
