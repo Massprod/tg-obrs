@@ -1330,6 +1330,21 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     await update.message.reply_text(about_message)
+
+
+async def handle_chat_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.message.chat
+
+    info = {
+        "chat_id": chat.id,
+        "title": chat.title,  # Group name
+        "type": chat.type,  # "group", "supergroup", "channel", or "private"
+        "username": chat.username,  # Only for public groups/channels
+    }
+
+    await update.message.reply_text(
+        "\n".join(f"{k}: {v}" for k, v in info.items() if v is not None)
+    )
 # endregion BasicCommands
 
 
@@ -1370,8 +1385,10 @@ def main():
     app.add_handler(
         CallbackQueryHandler(handle_psm_callbacks)
     )
-    
     # endregion PrivateSearchMessageButton
+    app.add_handler(
+        CallbackQueryHandler(handle_chat_info, pattern="groupinfo_")
+    )
     app.run_polling()
 
 
